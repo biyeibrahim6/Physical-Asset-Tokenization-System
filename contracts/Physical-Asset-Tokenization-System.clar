@@ -8,6 +8,8 @@
 (define-constant ERR_ALREADY_EXISTS (err u105))
 (define-constant ERR_TRANSFER_FAILED (err u106))
 (define-constant ERR_INVALID_PRICE (err u107))
+(define-constant ERR_ASSET_EXPIRED (err u108))
+(define-constant ERR_INVALID_EXPIRY (err u109))
 
 (define-data-var next-asset-id uint u1)
 (define-data-var platform-fee uint u50)
@@ -23,7 +25,9 @@
     token-price: uint,
     verified: bool,
     oracle: (optional principal),
-    created-at: uint
+    created-at: uint,
+    expires-at: (optional uint),
+    renewable: bool
   }
 )
 
@@ -69,6 +73,8 @@
   (category (string-ascii 20))
   (total-tokens uint)
   (token-price uint)
+  (expires-at (optional uint))
+  (renewable bool)
 )
   (let
     (
@@ -77,6 +83,10 @@
     )
     (asserts! (> total-tokens u0) ERR_INVALID_AMOUNT)
     (asserts! (> token-price u0) ERR_INVALID_PRICE)
+    (asserts! (match expires-at
+      some-expiry (> some-expiry (+ burn-block-height u1))
+      true
+    ) ERR_INVALID_EXPIRY)
     
     (map-set assets
       { asset-id: asset-id }
@@ -89,7 +99,9 @@
         token-price: token-price,
         verified: false,
         oracle: none,
-        created-at: current-block
+        created-at: current-block,
+        expires-at: expires-at,
+        renewable: renewable
       }
     )
     
@@ -152,6 +164,10 @@
       (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
     )
     (asserts! (get verified asset) ERR_ASSET_NOT_VERIFIED)
+    (asserts! (match (get expires-at asset)
+      some-expiry (> some-expiry burn-block-height)
+      true
+    ) ERR_ASSET_EXPIRED)
     (asserts! (>= (get amount holder-balance) tokens-amount) ERR_INSUFFICIENT_TOKENS)
     (asserts! (> tokens-amount u0) ERR_INVALID_AMOUNT)
     (asserts! (> price-per-token u0) ERR_INVALID_PRICE)
@@ -269,5 +285,46 @@
   (match (map-get? assets { asset-id: asset-id })
     asset (ok (* (get total-tokens asset) (get token-price asset)))
     ERR_ASSET_NOT_FOUND
+  )
+)
+
+(define-public (renew-asset (asset-id uint) (new-expiry uint))
+  (let
+    (
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner asset)) ERR_UNAUTHORIZED)
+    (asserts! (get renewable asset) ERR_UNAUTHORIZED)
+    (asserts! (> new-expiry burn-block-height) ERR_INVALID_EXPIRY)
+    
+    (map-set assets
+      { asset-id: asset-id }
+      (merge asset { expires-at: (some new-expiry) })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (is-asset-expired (asset-id uint))
+  (match (map-get? assets { asset-id: asset-id })
+    asset (match (get expires-at asset)
+      some-expiry (>= burn-block-height some-expiry)
+      false
+    )
+    true
+  )
+)
+
+(define-read-only (get-asset-expiry (asset-id uint))
+  (match (map-get? assets { asset-id: asset-id })
+    asset (get expires-at asset)
+    none
+  )
+)
+
+(define-read-only (is-asset-renewable (asset-id uint))
+  (match (map-get? assets { asset-id: asset-id })
+    asset (get renewable asset)
+    false
   )
 )
