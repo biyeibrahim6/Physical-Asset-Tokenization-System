@@ -10,9 +10,15 @@
 (define-constant ERR_INVALID_PRICE (err u107))
 (define-constant ERR_ASSET_EXPIRED (err u108))
 (define-constant ERR_INVALID_EXPIRY (err u109))
+(define-constant ERR_AUCTION_NOT_FOUND (err u110))
+(define-constant ERR_AUCTION_ENDED (err u111))
+(define-constant ERR_AUCTION_ACTIVE (err u112))
+(define-constant ERR_INVALID_DURATION (err u113))
+(define-constant ERR_INVALID_PRICE_DROP (err u114))
 
 (define-data-var next-asset-id uint u1)
 (define-data-var platform-fee uint u50)
+(define-data-var next-auction-id uint u1)
 
 (define-map assets
   { asset-id: uint }
@@ -49,6 +55,21 @@
 (define-map oracles
   { oracle: principal }
   { authorized: bool }
+)
+
+(define-map auctions
+  { auction-id: uint }
+  {
+    asset-id: uint,
+    seller: principal,
+    tokens-amount: uint,
+    start-price: uint,
+    end-price: uint,
+    start-block: uint,
+    duration: uint,
+    price-drop-interval: uint,
+    active: bool
+  }
 )
 
 (define-public (authorize-oracle (oracle principal))
@@ -325,6 +346,159 @@
 (define-read-only (is-asset-renewable (asset-id uint))
   (match (map-get? assets { asset-id: asset-id })
     asset (get renewable asset)
+    false
+  )
+)
+
+(define-public (create-dutch-auction 
+  (asset-id uint)
+  (tokens-amount uint)
+  (start-price uint)
+  (end-price uint)
+  (duration uint)
+  (price-drop-interval uint)
+)
+  (let
+    (
+      (auction-id (var-get next-auction-id))
+      (holder-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: asset-id, holder: tx-sender })))
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+    )
+    (asserts! (get verified asset) ERR_ASSET_NOT_VERIFIED)
+    (asserts! (match (get expires-at asset)
+      some-expiry (> some-expiry burn-block-height)
+      true
+    ) ERR_ASSET_EXPIRED)
+    (asserts! (>= (get amount holder-balance) tokens-amount) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (> tokens-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> start-price u0) ERR_INVALID_PRICE)
+    (asserts! (> end-price u0) ERR_INVALID_PRICE)
+    (asserts! (< end-price start-price) ERR_INVALID_PRICE)
+    (asserts! (> duration u10) ERR_INVALID_DURATION)
+    (asserts! (> price-drop-interval u0) ERR_INVALID_PRICE_DROP)
+    (asserts! (<= price-drop-interval duration) ERR_INVALID_PRICE_DROP)
+    
+    (map-set auctions
+      { auction-id: auction-id }
+      {
+        asset-id: asset-id,
+        seller: tx-sender,
+        tokens-amount: tokens-amount,
+        start-price: start-price,
+        end-price: end-price,
+        start-block: burn-block-height,
+        duration: duration,
+        price-drop-interval: price-drop-interval,
+        active: true
+      }
+    )
+    
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (bid-on-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (current-price (unwrap! (get-current-auction-price auction-id) ERR_AUCTION_ENDED))
+      (total-cost (* current-price (get tokens-amount auction)))
+      (fee-amount (/ (* total-cost (var-get platform-fee)) u10000))
+      (seller-amount (- total-cost fee-amount))
+      (buyer-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: (get asset-id auction), holder: tx-sender })))
+      (seller-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: (get asset-id auction), holder: (get seller auction) })))
+    )
+    (asserts! (get active auction) ERR_AUCTION_ENDED)
+    (asserts! (not (is-eq tx-sender (get seller auction))) ERR_UNAUTHORIZED)
+    
+    (try! (stx-transfer? total-cost tx-sender (get seller auction)))
+    
+    (if (> fee-amount u0)
+      (try! (stx-transfer? fee-amount (get seller auction) CONTRACT_OWNER))
+      true
+    )
+    
+    (map-set asset-tokens
+      { asset-id: (get asset-id auction), holder: tx-sender }
+      { amount: (+ (get amount buyer-balance) (get tokens-amount auction)) }
+    )
+    
+    (map-set asset-tokens
+      { asset-id: (get asset-id auction), holder: (get seller auction) }
+      { amount: (- (get amount seller-balance) (get tokens-amount auction)) }
+    )
+    
+    (map-set auctions
+      { auction-id: auction-id }
+      (merge auction { active: false })
+    )
+    
+    (ok current-price)
+  )
+)
+
+(define-public (cancel-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller auction)) ERR_UNAUTHORIZED)
+    (asserts! (get active auction) ERR_AUCTION_ENDED)
+    
+    (map-set auctions
+      { auction-id: auction-id }
+      (merge auction { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-current-auction-price (auction-id uint))
+  (match (map-get? auctions { auction-id: auction-id })
+    auction
+      (let
+        (
+          (blocks-elapsed (- burn-block-height (get start-block auction)))
+          (auction-ended (>= blocks-elapsed (get duration auction)))
+          (price-steps (/ blocks-elapsed (get price-drop-interval auction)))
+          (total-price-steps (/ (get duration auction) (get price-drop-interval auction)))
+          (price-drop-per-step (/ (- (get start-price auction) (get end-price auction)) total-price-steps))
+          (current-price (- (get start-price auction) (* price-steps price-drop-per-step)))
+        )
+        (if (get active auction)
+          (if auction-ended
+            (err ERR_AUCTION_ENDED)
+            (ok (if (>= current-price (get end-price auction)) current-price (get end-price auction)))
+          )
+          (err ERR_AUCTION_ENDED)
+        )
+      )
+    (err ERR_AUCTION_NOT_FOUND)
+  )
+)
+
+(define-read-only (get-next-auction-id)
+  (var-get next-auction-id)
+)
+
+(define-read-only (is-auction-active (auction-id uint))
+  (match (map-get? auctions { auction-id: auction-id })
+    auction
+      (let
+        (
+          (blocks-elapsed (- burn-block-height (get start-block auction)))
+          (auction-ended (>= blocks-elapsed (get duration auction)))
+        )
+        (and (get active auction) (not auction-ended))
+      )
     false
   )
 )
