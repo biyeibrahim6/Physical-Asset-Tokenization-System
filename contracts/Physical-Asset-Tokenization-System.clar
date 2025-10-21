@@ -15,10 +15,15 @@
 (define-constant ERR_AUCTION_ACTIVE (err u112))
 (define-constant ERR_INVALID_DURATION (err u113))
 (define-constant ERR_INVALID_PRICE_DROP (err u114))
+(define-constant ERR_AUDIT_NOT_FOUND (err u115))
+(define-constant ERR_AUDITOR_NOT_AUTHORIZED (err u116))
+(define-constant ERR_INVALID_AUDIT_STATUS (err u117))
+(define-constant ERR_AUDIT_ALREADY_EXISTS (err u118))
 
 (define-data-var next-asset-id uint u1)
 (define-data-var platform-fee uint u50)
 (define-data-var next-auction-id uint u1)
+(define-data-var next-audit-id uint u1)
 
 (define-map assets
   { asset-id: uint }
@@ -69,6 +74,40 @@
     duration: uint,
     price-drop-interval: uint,
     active: bool
+  }
+)
+
+(define-map auditors
+  { auditor: principal }
+  { 
+    authorized: bool,
+    specialization: (string-ascii 50),
+    reputation-score: uint
+  }
+)
+
+(define-map asset-audits
+  { audit-id: uint }
+  {
+    asset-id: uint,
+    auditor: principal,
+    audit-type: (string-ascii 30),
+    status: (string-ascii 20),
+    findings: (string-ascii 500),
+    compliance-score: uint,
+    audit-date: uint,
+    expiry-date: uint,
+    cost: uint
+  }
+)
+
+(define-map asset-audit-history
+  { asset-id: uint }
+  { 
+    total-audits: uint,
+    last-audit-date: uint,
+    current-compliance-score: uint,
+    audit-ids: (list 20 uint)
   }
 )
 
@@ -500,5 +539,193 @@
         (and (get active auction) (not auction-ended))
       )
     false
+  )
+)
+
+;; ASSET AUDIT SYSTEM FUNCTIONS
+
+(define-public (authorize-auditor 
+  (auditor principal) 
+  (specialization (string-ascii 50))
+  (initial-reputation uint)
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= initial-reputation u100) ERR_INVALID_AUDIT_STATUS)
+    
+    (map-set auditors
+      { auditor: auditor }
+      {
+        authorized: true,
+        specialization: specialization,
+        reputation-score: initial-reputation
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-auditor (auditor principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    
+    (map-set auditors
+      { auditor: auditor }
+      (merge 
+        (default-to 
+          { authorized: false, specialization: "", reputation-score: u0 }
+          (map-get? auditors { auditor: auditor })
+        )
+        { authorized: false }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (conduct-asset-audit
+  (asset-id uint)
+  (audit-type (string-ascii 30))
+  (findings (string-ascii 500))
+  (compliance-score uint)
+  (expiry-blocks uint)
+  (audit-cost uint)
+)
+  (let
+    (
+      (audit-id (var-get next-audit-id))
+      (auditor-info (unwrap! (map-get? auditors { auditor: tx-sender }) ERR_AUDITOR_NOT_AUTHORIZED))
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+      (current-history (default-to 
+        { total-audits: u0, last-audit-date: u0, current-compliance-score: u0, audit-ids: (list) }
+        (map-get? asset-audit-history { asset-id: asset-id })
+      ))
+    )
+    (asserts! (get authorized auditor-info) ERR_AUDITOR_NOT_AUTHORIZED)
+    (asserts! (<= compliance-score u100) ERR_INVALID_AUDIT_STATUS)
+    (asserts! (> expiry-blocks u0) ERR_INVALID_EXPIRY)
+    
+    (map-set asset-audits
+      { audit-id: audit-id }
+      {
+        asset-id: asset-id,
+        auditor: tx-sender,
+        audit-type: audit-type,
+        status: "completed",
+        findings: findings,
+        compliance-score: compliance-score,
+        audit-date: burn-block-height,
+        expiry-date: (+ burn-block-height expiry-blocks),
+        cost: audit-cost
+      }
+    )
+    
+    (map-set asset-audit-history
+      { asset-id: asset-id }
+      {
+        total-audits: (+ (get total-audits current-history) u1),
+        last-audit-date: burn-block-height,
+        current-compliance-score: compliance-score,
+        audit-ids: (unwrap! (as-max-len? (append (get audit-ids current-history) audit-id) u20) ERR_INVALID_AMOUNT)
+      }
+    )
+    
+    (var-set next-audit-id (+ audit-id u1))
+    (ok audit-id)
+  )
+)
+
+(define-public (update-auditor-reputation (auditor principal) (new-score uint))
+  (let
+    (
+      (auditor-info (unwrap! (map-get? auditors { auditor: auditor }) ERR_AUDITOR_NOT_AUTHORIZED))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-score u100) ERR_INVALID_AUDIT_STATUS)
+    
+    (map-set auditors
+      { auditor: auditor }
+      (merge auditor-info { reputation-score: new-score })
+    )
+    (ok true)
+  )
+)
+
+(define-public (request-audit (asset-id uint) (audit-type (string-ascii 30)) (budget uint))
+  (let
+    (
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+      (audit-id (var-get next-audit-id))
+    )
+    (asserts! (is-eq tx-sender (get owner asset)) ERR_UNAUTHORIZED)
+    (asserts! (> budget u0) ERR_INVALID_AMOUNT)
+    
+    (map-set asset-audits
+      { audit-id: audit-id }
+      {
+        asset-id: asset-id,
+        auditor: tx-sender,
+        audit-type: audit-type,
+        status: "requested",
+        findings: "",
+        compliance-score: u0,
+        audit-date: burn-block-height,
+        expiry-date: u0,
+        cost: budget
+      }
+    )
+    
+    (var-set next-audit-id (+ audit-id u1))
+    (ok audit-id)
+  )
+)
+
+;; READ-ONLY AUDIT FUNCTIONS
+
+(define-read-only (get-auditor-info (auditor principal))
+  (map-get? auditors { auditor: auditor })
+)
+
+(define-read-only (get-asset-audit (audit-id uint))
+  (map-get? asset-audits { audit-id: audit-id })
+)
+
+(define-read-only (get-asset-audit-history (asset-id uint))
+  (map-get? asset-audit-history { asset-id: asset-id })
+)
+
+(define-read-only (get-asset-compliance-score (asset-id uint))
+  (match (map-get? asset-audit-history { asset-id: asset-id })
+    history (ok (get current-compliance-score history))
+    ERR_AUDIT_NOT_FOUND
+  )
+)
+
+(define-read-only (is-audit-valid (audit-id uint))
+  (match (map-get? asset-audits { audit-id: audit-id })
+    audit (< burn-block-height (get expiry-date audit))
+    false
+  )
+)
+
+(define-read-only (get-next-audit-id)
+  (var-get next-audit-id)
+)
+
+(define-read-only (calculate-audit-risk-score (asset-id uint))
+  (match (map-get? asset-audit-history { asset-id: asset-id })
+    history
+      (let
+        (
+          (blocks-since-last-audit (- burn-block-height (get last-audit-date history)))
+          (compliance-score (get current-compliance-score history))
+          (audit-frequency (get total-audits history))
+          (time-penalty (if (> blocks-since-last-audit u1000) u20 u0))
+          (frequency-bonus (if (> audit-frequency u3) u10 u0))
+          (risk-score (+ (- u100 compliance-score) time-penalty))
+        )
+        (ok (if (> risk-score frequency-bonus) (- risk-score frequency-bonus) u0))
+      )
+    (ok u100)
   )
 )
