@@ -19,11 +19,19 @@
 (define-constant ERR_AUDITOR_NOT_AUTHORIZED (err u116))
 (define-constant ERR_INVALID_AUDIT_STATUS (err u117))
 (define-constant ERR_AUDIT_ALREADY_EXISTS (err u118))
+(define-constant ERR_ESCROW_NOT_FOUND (err u119))
+(define-constant ERR_ESCROW_ALREADY_RELEASED (err u120))
+(define-constant ERR_ESCROW_EXPIRED (err u121))
+(define-constant ERR_ESCROW_NOT_EXPIRED (err u122))
+(define-constant ERR_ESCROW_ALREADY_FUNDED (err u123))
+(define-constant ERR_ESCROW_NOT_FUNDED (err u124))
+(define-constant ERR_INVALID_MILESTONE (err u125))
 
 (define-data-var next-asset-id uint u1)
 (define-data-var platform-fee uint u50)
 (define-data-var next-auction-id uint u1)
 (define-data-var next-audit-id uint u1)
+(define-data-var next-escrow-id uint u1)
 
 (define-map assets
   { asset-id: uint }
@@ -108,6 +116,24 @@
     last-audit-date: uint,
     current-compliance-score: uint,
     audit-ids: (list 20 uint)
+  }
+)
+
+(define-map escrows
+  { escrow-id: uint }
+  {
+    asset-id: uint,
+    buyer: principal,
+    seller: principal,
+    token-amount: uint,
+    total-price: uint,
+    funded: bool,
+    released: bool,
+    milestone-count: uint,
+    milestones-completed: uint,
+    created-at: uint,
+    expires-at: uint,
+    arbiter: (optional principal)
   }
 )
 
@@ -727,5 +753,221 @@
         (ok (if (> risk-score frequency-bonus) (- risk-score frequency-bonus) u0))
       )
     (ok u100)
+  )
+)
+
+(define-public (create-escrow
+  (asset-id uint)
+  (seller principal)
+  (token-amount uint)
+  (total-price uint)
+  (milestone-count uint)
+  (duration-blocks uint)
+  (arbiter (optional principal))
+)
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+      (seller-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: asset-id, holder: seller })))
+    )
+    (asserts! (get verified asset) ERR_ASSET_NOT_VERIFIED)
+    (asserts! (>= (get amount seller-balance) token-amount) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (> token-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> total-price u0) ERR_INVALID_PRICE)
+    (asserts! (> milestone-count u0) ERR_INVALID_MILESTONE)
+    (asserts! (<= milestone-count u10) ERR_INVALID_MILESTONE)
+    (asserts! (> duration-blocks u10) ERR_INVALID_DURATION)
+    (asserts! (not (is-eq tx-sender seller)) ERR_UNAUTHORIZED)
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      {
+        asset-id: asset-id,
+        buyer: tx-sender,
+        seller: seller,
+        token-amount: token-amount,
+        total-price: total-price,
+        funded: false,
+        released: false,
+        milestone-count: milestone-count,
+        milestones-completed: u0,
+        created-at: burn-block-height,
+        expires-at: (+ burn-block-height duration-blocks),
+        arbiter: arbiter
+      }
+    )
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (fund-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get buyer escrow)) ERR_UNAUTHORIZED)
+    (asserts! (not (get funded escrow)) ERR_ESCROW_ALREADY_FUNDED)
+    (asserts! (< burn-block-height (get expires-at escrow)) ERR_ESCROW_EXPIRED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    
+    (try! (stx-transfer? (get total-price escrow) tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { funded: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (new-milestones-completed (+ (get milestones-completed escrow) u1))
+      (milestone-payment (/ (get total-price escrow) (get milestone-count escrow)))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get buyer escrow))
+      (match (get arbiter escrow)
+        arbiter-principal (is-eq tx-sender arbiter-principal)
+        false
+      )
+    ) ERR_UNAUTHORIZED)
+    (asserts! (get funded escrow) ERR_ESCROW_NOT_FUNDED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (< burn-block-height (get expires-at escrow)) ERR_ESCROW_EXPIRED)
+    (asserts! (< (get milestones-completed escrow) (get milestone-count escrow)) ERR_INVALID_MILESTONE)
+    
+    (try! (as-contract (stx-transfer? milestone-payment tx-sender (get seller escrow))))
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { milestones-completed: new-milestones-completed })
+    )
+    (ok new-milestones-completed)
+  )
+)
+
+(define-public (release-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+      (buyer-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: (get asset-id escrow), holder: (get buyer escrow) })))
+      (seller-balance (default-to { amount: u0 } 
+        (map-get? asset-tokens { asset-id: (get asset-id escrow), holder: (get seller escrow) })))
+      (remaining-payment (- (get total-price escrow) 
+        (* (get milestones-completed escrow) (/ (get total-price escrow) (get milestone-count escrow)))))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get buyer escrow))
+      (match (get arbiter escrow)
+        arbiter-principal (is-eq tx-sender arbiter-principal)
+        false
+      )
+    ) ERR_UNAUTHORIZED)
+    (asserts! (get funded escrow) ERR_ESCROW_NOT_FUNDED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (>= (get milestones-completed escrow) (get milestone-count escrow)) ERR_INVALID_MILESTONE)
+    
+    (if (> remaining-payment u0)
+      (try! (as-contract (stx-transfer? remaining-payment tx-sender (get seller escrow))))
+      true
+    )
+    
+    (map-set asset-tokens
+      { asset-id: (get asset-id escrow), holder: (get buyer escrow) }
+      { amount: (+ (get amount buyer-balance) (get token-amount escrow)) }
+    )
+    
+    (map-set asset-tokens
+      { asset-id: (get asset-id escrow), holder: (get seller escrow) }
+      { amount: (- (get amount seller-balance) (get token-amount escrow)) }
+    )
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { released: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get buyer escrow))
+      (is-eq tx-sender (get seller escrow))
+      (match (get arbiter escrow)
+        arbiter-principal (is-eq tx-sender arbiter-principal)
+        false
+      )
+    ) ERR_UNAUTHORIZED)
+    (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_RELEASED)
+    (asserts! (or 
+      (not (get funded escrow))
+      (>= burn-block-height (get expires-at escrow))
+    ) ERR_ESCROW_NOT_EXPIRED)
+    
+    (if (get funded escrow)
+      (let
+        (
+          (milestones-paid (* (get milestones-completed escrow) (/ (get total-price escrow) (get milestone-count escrow))))
+          (refund-amount (- (get total-price escrow) milestones-paid))
+        )
+        (if (> refund-amount u0)
+          (try! (as-contract (stx-transfer? refund-amount tx-sender (get buyer escrow))))
+          true
+        )
+      )
+      true
+    )
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { released: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (get-next-escrow-id)
+  (var-get next-escrow-id)
+)
+
+(define-read-only (get-escrow-progress (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow
+      (ok {
+        milestones-completed: (get milestones-completed escrow),
+        milestone-count: (get milestone-count escrow),
+        progress-percentage: (/ (* (get milestones-completed escrow) u100) (get milestone-count escrow)),
+        is-complete: (>= (get milestones-completed escrow) (get milestone-count escrow))
+      })
+    ERR_ESCROW_NOT_FOUND
+  )
+)
+
+(define-read-only (is-escrow-active (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow
+      (and 
+        (get funded escrow)
+        (not (get released escrow))
+        (< burn-block-height (get expires-at escrow))
+      )
+    false
   )
 )
